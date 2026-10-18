@@ -1,0 +1,9 @@
+LIBRARY XAPOFX1_5
+EXPORTS
+    CreateFX
+    DGMalloc_Status
+    DGMalloc_ForeignFrees
+    DGMalloc_Stats
+    DGMalloc_Finding
+    DGMalloc_Cut
+    DGMalloc_ProcessInfo

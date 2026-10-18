@@ -1,0 +1,10 @@
+mimalloc v2.1.7, commit 8c532c32c3c96e5ba1f2283e032f69ead8add00f (github.com/microsoft/mimalloc).
+Only include/, src/ and LICENSE are vendored.
+
+Local patches (two): src/init.c, mi_process_load - atexit(&mi_process_done) is skipped when
+DGMALLOC_KEEP_ALIVE_ON_EXIT is defined, so the allocator is never collected or torn down while
+the engine is still freeing through it during process exit.
+
+Local patch 2: include/mimalloc/internal.h, mi_block_next - with DGMALLOC_VALIDATE_FREELIST the
+non-encoded build checks that a free list's next link stays in the same page (the check the
+encoded build already makes) and cuts the list there, reporting through dgmalloc_freelist_cut.
