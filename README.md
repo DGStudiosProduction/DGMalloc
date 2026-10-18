@@ -18,6 +18,8 @@ Output: `x64\Release\XAPOFX1_5.dll`
 
 On any other server build it stays off and the server runs on the engine allocator.
 
+Log: `ShooterGame\Saved\Logs\DGMalloc.log`
+
 ## Uninstall
 
 Stop the server, delete `ShooterGame\Binaries\Win64\XAPOFX1_5.dll`, start the server.

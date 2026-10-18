@@ -3,6 +3,10 @@
 #include <cstring>
 #include <new>
 #include <intrin.h>
+#include <psapi.h>
+#include <cstdarg>
+#include <cstdio>
+#include <cwchar>
 
 #include "mimalloc.h"
 
@@ -262,6 +266,137 @@ namespace
 
     using CreateFXFn = HRESULT (__cdecl*)(const GUID*, void**, const void*, UINT32);
     CreateFXFn volatile g_RealCreateFX = nullptr;
+
+    HANDLE g_LogFile = INVALID_HANDLE_VALUE;
+    uintptr_t g_ExeBase = 0;
+    uintptr_t g_ExeEnd = 0;
+
+    void LogLine(const char* fmt, ...)
+    {
+        if (g_LogFile == INVALID_HANDLE_VALUE) return;
+        char buf[1024];
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        int n = snprintf(buf, sizeof(buf), "%04u-%02u-%02u %02u:%02u:%02u ", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        va_list args;
+        va_start(args, fmt);
+        const int m = vsnprintf(buf + n, sizeof(buf) - n - 2, fmt, args);
+        va_end(args);
+        if (m > 0) n += (m < static_cast<int>(sizeof(buf)) - n - 2) ? m : static_cast<int>(sizeof(buf)) - n - 3;
+        buf[n++] = '\r';
+        buf[n++] = '\n';
+        DWORD written = 0;
+        WriteFile(g_LogFile, buf, static_cast<DWORD>(n), &written, nullptr);
+    }
+
+    bool InExe(uint64_t v) { return v >= g_ExeBase && v < g_ExeEnd; }
+
+    uint64_t ReadQword(uint64_t addr)
+    {
+        uint64_t v = 0;
+        __try { v = *reinterpret_cast<const volatile uint64_t*>(addr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { v = 0; }
+        return v;
+    }
+
+    void DescribeValue(uint64_t v, char* out, size_t outSize)
+    {
+        if (InExe(v)) { snprintf(out, outSize, "0x%016llX (exe+0x%llX)", v, v - g_ExeBase); return; }
+        const uint64_t vptr = (v >= 0x10000 && (v & 7) == 0) ? ReadQword(v) : 0;
+        if (InExe(vptr)) snprintf(out, outSize, "0x%016llX (object, vtable exe+0x%llX)", v, vptr - g_ExeBase);
+        else snprintf(out, outSize, "0x%016llX", v);
+    }
+
+    void OpenLog()
+    {
+        wchar_t path[MAX_PATH];
+        const DWORD len = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH) return;
+        for (int up = 0; up < 3; ++up)
+        {
+            wchar_t* slash = wcsrchr(path, L'\\');
+            if (!slash) return;
+            *slash = 0;
+        }
+        if (wcslen(path) + 32 >= MAX_PATH) return;
+        wcscat_s(path, L"\\Saved\\Logs");
+        CreateDirectoryW(path, nullptr);
+        wcscat_s(path, L"\\DGMalloc.log");
+        g_LogFile = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+
+    void LogMemory()
+    {
+        size_t elapsed = 0, user = 0, sys = 0, rss = 0, peakRss = 0, commit = 0, peakCommit = 0, faults = 0;
+        mi_process_info(&elapsed, &user, &sys, &rss, &peakRss, &commit, &peakCommit, &faults);
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        pmc.cb = sizeof(pmc);
+        K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+        LogLine("memory | process private %llu MB, working set %llu MB | mimalloc commit %llu MB (peak %llu MB), "
+                "rss %llu MB | quarantined %lld blocks total",
+                static_cast<unsigned long long>(pmc.PrivateUsage >> 20), static_cast<unsigned long long>(pmc.WorkingSetSize >> 20),
+                static_cast<unsigned long long>(commit >> 20), static_cast<unsigned long long>(peakCommit >> 20),
+                static_cast<unsigned long long>(rss >> 20), static_cast<long long>(g_Quarantined));
+    }
+
+    DWORD WINAPI Reporter(LPVOID)
+    {
+        OpenLog();
+        LogLine("DGMalloc %s", g_Status);
+        LONG findingsSeen = 0, cutsSeen = 0, foreignSeen = 0;
+        DWORD lastMemory = 0;
+        for (;;)
+        {
+            Sleep(30000);
+            const LONG findings = g_FindingsWritten < kMaxFindings ? g_FindingsWritten : kMaxFindings;
+            for (; findingsSeen < findings; ++findingsSeen)
+            {
+                const Finding& f = g_Findings[findingsSeen];
+                char value[160];
+                DescribeValue(f.value, value, sizeof(value));
+                LogLine("write after free in quarantine | block %p (%u bytes) offset %u | value %s | freed from exe+0x%llX",
+                        f.block, f.size, f.offset, value,
+                        InExe(reinterpret_cast<uint64_t>(f.from)) ? reinterpret_cast<uint64_t>(f.from) - g_ExeBase : 0ULL);
+            }
+            if (g_FindingCount > findings && findingsSeen == kMaxFindings)
+                LogLine("write after free in quarantine | %ld total (first %ld listed)", g_FindingCount, kMaxFindings);
+            const LONG cuts = g_CutsWritten < kMaxCuts ? g_CutsWritten : kMaxCuts;
+            for (; cutsSeen < cuts; ++cutsSeen)
+            {
+                const Cut& c = g_Cuts[cutsSeen];
+                char value[160];
+                DescribeValue(reinterpret_cast<uint64_t>(c.next), value, sizeof(value));
+                LogLine("free list cut | block %p (%llu bytes) | link %s", c.block, static_cast<unsigned long long>(c.blockSize), value);
+            }
+            if (g_ForeignFrees != foreignSeen)
+            {
+                foreignSeen = g_ForeignFrees;
+                LogLine("foreign frees %ld", foreignSeen);
+            }
+            const DWORD now = GetTickCount();
+            if (lastMemory == 0 || now - lastMemory >= 600000)
+            {
+                lastMemory = now;
+                LogMemory();
+            }
+        }
+    }
+
+    void StartReporter()
+    {
+        const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+        const IMAGE_NT_HEADERS* nt = base ? NtHeaders(base) : nullptr;
+        if (!nt) return;
+        g_ExeBase = reinterpret_cast<uintptr_t>(base);
+        g_ExeEnd = g_ExeBase + nt->OptionalHeader.SizeOfImage;
+        HANDLE t = CreateThread(nullptr, 64 * 1024, &Reporter, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+        if (t)
+        {
+            SetThreadPriority(t, THREAD_PRIORITY_LOWEST);
+            CloseHandle(t);
+        }
+    }
 }
 
 extern "C" HRESULT __cdecl CreateFX(const GUID* clsid, void** effect, const void* initData, UINT32 initDataSize)
@@ -333,7 +468,11 @@ extern "C" bool DGMalloc_Cut(long i, const void** block, const void** next, unsi
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
 {
-    if (reason == DLL_PROCESS_ATTACH) Install();
+    if (reason == DLL_PROCESS_ATTACH)
+    {
+        Install();
+        if (g_Installed) StartReporter();
+    }
     if (reason == DLL_THREAD_DETACH && g_Installed) FlushThreadQuarantine();
 
     return TRUE;
