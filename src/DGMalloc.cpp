@@ -10,6 +10,8 @@
 
 #include "mimalloc.h"
 
+#include <unordered_map>
+
 namespace
 {
     constexpr DWORD     kExeTimeDateStamp = 0x65FF427D;
@@ -59,9 +61,61 @@ namespace
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     }
 
+    constexpr uint64_t kLargeMin = 32768 + 1;
+    constexpr uint32_t kLargeAlignMax = 64 * 1024;
+
+    SRWLOCK g_LargeLock = SRWLOCK_INIT;
+    std::unordered_map<void*, size_t>* g_Large = nullptr;
+    volatile LONG64 g_LargeBytes = 0;
+    volatile LONG64 g_LargePeakBytes = 0;
+
+    inline size_t RoundPage(uint64_t n) { return static_cast<size_t>((n + 4095) & ~static_cast<uint64_t>(4095)); }
+
+    bool LargeSize(void* p, size_t& size)
+    {
+        if (!g_Large) return false;
+        AcquireSRWLockShared(&g_LargeLock);
+        auto it = g_Large->find(p);
+        const bool found = it != g_Large->end();
+        if (found) size = it->second;
+        ReleaseSRWLockShared(&g_LargeLock);
+        return found;
+    }
+
+    void* LargeAlloc(uint64_t count)
+    {
+        const size_t size = RoundPage(count);
+        void* p = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!p) return nullptr;
+        AcquireSRWLockExclusive(&g_LargeLock);
+        (*g_Large)[p] = size;
+        ReleaseSRWLockExclusive(&g_LargeLock);
+        const LONG64 now = InterlockedAdd64(&g_LargeBytes, static_cast<LONG64>(size));
+        LONG64 peak = g_LargePeakBytes;
+        while (now > peak && InterlockedCompareExchange64(&g_LargePeakBytes, now, peak) != peak) peak = g_LargePeakBytes;
+        return p;
+    }
+
+    bool LargeFree(void* p)
+    {
+        if (!g_Large) return false;
+        size_t size = 0;
+        AcquireSRWLockExclusive(&g_LargeLock);
+        auto it = g_Large->find(p);
+        const bool found = it != g_Large->end();
+        if (found) { size = it->second; g_Large->erase(it); }
+        ReleaseSRWLockExclusive(&g_LargeLock);
+        if (!found) return false;
+        VirtualFree(p, 0, MEM_RELEASE);
+        InterlockedAdd64(&g_LargeBytes, -static_cast<LONG64>(size));
+        return true;
+    }
+
     void* DoMalloc(uint64_t count, uint32_t align)
     {
-        void* p = align <= kMinAlign ? mi_malloc(Round16(count)) : mi_malloc_aligned(count, align);
+        void* p = nullptr;
+        if (count >= kLargeMin && align <= kLargeAlignMax && g_Large) p = LargeAlloc(count);
+        else p = align <= kMinAlign ? mi_malloc(Round16(count)) : mi_malloc_aligned(count, align);
         if (!p) Fatal(kExcOutOfMemory, count, align, nullptr);
         return p;
     }
@@ -123,6 +177,7 @@ namespace
     void DoFree(void* p, void* from)
     {
         if (!p) return;
+        if (LargeFree(p)) return;
         if (!mi_is_in_heap_region(p)) { InterlockedIncrement(&g_ForeignFrees); return; }
         const size_t usable = mi_usable_size(p);
         Quarantine* qu = usable <= kQuarantineMax ? ThreadQuarantine() : nullptr;
@@ -154,6 +209,15 @@ namespace
     {
         if (!p) return DoMalloc(count, align);
         if (count == 0) { DoFree(p, from); return nullptr; }
+        size_t largeSize = 0;
+        if (LargeSize(p, largeSize))
+        {
+            if (count <= largeSize && count >= largeSize / 2) return p;
+            void* q = DoMalloc(count, align);
+            memcpy(q, p, largeSize < count ? largeSize : static_cast<size_t>(count));
+            LargeFree(p);
+            return q;
+        }
         if (!mi_is_in_heap_region(p)) Fatal(kExcForeignBlock, count, align, p);
 
         const size_t usable = mi_usable_size(p);
@@ -173,6 +237,7 @@ namespace
         virtual bool Exec(UWorld*, const wchar_t*, FOutputDevice*) { return false; }
         virtual uint64_t QuantizeSize(uint64_t count, uint32_t align)
         {
+            if (count >= kLargeMin && align <= kLargeAlignMax) return RoundPage(count);
             return align <= kMinAlign ? mi_good_size(Round16(count)) : count;
         }
         virtual void* Malloc(uint64_t count, uint32_t align) { return DoMalloc(count, align); }
@@ -191,7 +256,10 @@ namespace
         virtual bool  ValidateHeap() { return true; }
         virtual bool  GetAllocationSize(void* p, uint64_t* sizeOut)
         {
-            if (!p || !mi_is_in_heap_region(p)) return false;
+            if (!p) return false;
+            size_t large = 0;
+            if (LargeSize(p, large)) { *sizeOut = large; return true; }
+            if (!mi_is_in_heap_region(p)) return false;
             *sizeOut = mi_usable_size(p);
             return true;
         }
@@ -257,6 +325,9 @@ namespace
         mi_option_set(mi_option_purge_delay, 0);
 
         mi_free(mi_malloc(16));
+        auto* large = new std::unordered_map<void*, size_t>();
+        large->reserve(1 << 17);
+        g_Large = large;
 
         DGMallocImpl* alloc = new (g_Storage) DGMallocImpl();
         InterlockedExchangePointer(gmalloc, alloc);
@@ -268,6 +339,7 @@ namespace
     CreateFXFn volatile g_RealCreateFX = nullptr;
 
     HANDLE g_LogFile = INVALID_HANDLE_VALUE;
+    DWORD g_StartTick = 0;
     uintptr_t g_ExeBase = 0;
     uintptr_t g_ExeEnd = 0;
 
@@ -334,10 +406,11 @@ namespace
         pmc.cb = sizeof(pmc);
         K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
         LogLine("memory | process private %llu MB, working set %llu MB | mimalloc commit %llu MB (peak %llu MB), "
-                "rss %llu MB | quarantined %lld blocks total",
+                "rss %llu MB | large blocks %lld MB (peak %lld MB) | quarantined %lld blocks total",
                 static_cast<unsigned long long>(pmc.PrivateUsage >> 20), static_cast<unsigned long long>(pmc.WorkingSetSize >> 20),
                 static_cast<unsigned long long>(commit >> 20), static_cast<unsigned long long>(peakCommit >> 20),
-                static_cast<unsigned long long>(rss >> 20), static_cast<long long>(g_Quarantined));
+                static_cast<unsigned long long>(rss >> 20), static_cast<long long>(g_LargeBytes >> 20),
+                static_cast<long long>(g_LargePeakBytes >> 20), static_cast<long long>(g_Quarantined));
     }
 
     DWORD WINAPI Reporter(LPVOID)
@@ -348,7 +421,7 @@ namespace
         DWORD lastMemory = 0;
         for (;;)
         {
-            Sleep(30000);
+            Sleep(GetTickCount() - g_StartTick < 300000 ? 5000 : 30000);
             const LONG findings = g_FindingsWritten < kMaxFindings ? g_FindingsWritten : kMaxFindings;
             for (; findingsSeen < findings; ++findingsSeen)
             {
@@ -375,7 +448,7 @@ namespace
                 LogLine("foreign frees %ld", foreignSeen);
             }
             const DWORD now = GetTickCount();
-            if (lastMemory == 0 || now - lastMemory >= 600000)
+            if (lastMemory == 0 || now - lastMemory >= (now - g_StartTick < 300000 ? 5000u : 600000u))
             {
                 lastMemory = now;
                 LogMemory();
@@ -390,6 +463,7 @@ namespace
         if (!nt) return;
         g_ExeBase = reinterpret_cast<uintptr_t>(base);
         g_ExeEnd = g_ExeBase + nt->OptionalHeader.SizeOfImage;
+        g_StartTick = GetTickCount();
         HANDLE t = CreateThread(nullptr, 64 * 1024, &Reporter, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
         if (t)
         {
