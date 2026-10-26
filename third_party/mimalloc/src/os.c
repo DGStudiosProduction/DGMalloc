@@ -64,6 +64,17 @@ void _mi_os_init(void) {
   _mi_prim_mem_init(&mi_os_mem_config);
 }
 
+#ifdef DGMALLOC_LARGE_PAGES
+// DGMalloc: mimalloc's process init runs (CRT init) before DGMalloc can set its options, so large pages are switched on
+// here afterwards: the option, then the memory config again (it enables SeLockMemoryPrivilege and reads the page size).
+// Returns the large page size, 0 when the process may not lock pages.
+size_t dgmalloc_os_enable_large_pages(void) {
+  mi_option_enable(mi_option_allow_large_os_pages);
+  _mi_prim_mem_init(&mi_os_mem_config);
+  return mi_os_mem_config.large_page_size;
+}
+#endif
+
 
 /* -----------------------------------------------------------
   Util
