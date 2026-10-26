@@ -11,6 +11,8 @@
 #include "mimalloc.h"
 
 #include <unordered_map>
+#include <map>
+#include <vector>
 
 namespace
 {
@@ -92,15 +94,120 @@ namespace
         return found;
     }
 
+    // ---- large blocks from write-watched chunks ------------------------------------------------------------------------
+    // Blocks over 32 KB used to be one VirtualAlloc each (FMallocBinned does the same): with MEM_WRITE_WATCH that made
+    // 63k regions, and reading them cost 14 us each (837 ms at a boot GC, 526). Now they are placed in 1 GiB chunks
+    // reserved with MEM_WRITE_WATCH, in 64 KB units (the waste the VirtualAlloc granularity had anyway); the block's pages
+    // are committed when it is handed out and decommitted when it is freed, so freed memory still goes back to the OS. A
+    // block of 256 MB or more keeps its own reservation. The engine side then reads a dozen regions instead of 60k.
+    constexpr size_t kChunkSize = size_t(1) << 30;
+    constexpr size_t kUnit = 64 * 1024;
+    constexpr size_t kOwnRegionMin = size_t(256) << 20;
+
+    struct Chunk { uintptr_t base; unsigned long long gen; };
+    SRWLOCK g_FreeLock = SRWLOCK_INIT;
+    std::vector<Chunk>* g_Chunks = nullptr;
+    std::map<uintptr_t, size_t>* g_FreeByAddr = nullptr;       // extent start -> length (bytes, whole units)
+    std::multimap<size_t, uintptr_t>* g_FreeBySize = nullptr;  // length -> start (best fit)
+    std::unordered_map<void*, size_t>* g_Extent = nullptr;     // chunk block -> its extent length (own regions: absent)
+
+    size_t ChunkOf(uintptr_t a)
+    {
+        for (size_t i = 0; i < g_Chunks->size(); ++i)
+            if (a >= (*g_Chunks)[i].base && a < (*g_Chunks)[i].base + kChunkSize) return i;
+        return SIZE_MAX;
+    }
+
+    void AddFree(uintptr_t at, size_t len)
+    {
+        (*g_FreeByAddr)[at] = len;
+        g_FreeBySize->emplace(len, at);
+    }
+
+    void RemoveFree(std::map<uintptr_t, size_t>::iterator it)
+    {
+        auto range = g_FreeBySize->equal_range(it->second);
+        for (auto j = range.first; j != range.second; ++j)
+            if (j->second == it->first) { g_FreeBySize->erase(j); break; }
+        g_FreeByAddr->erase(it);
+    }
+
+    /// An extent of `len` bytes (whole units), or 0. g_FreeLock held.
+    uintptr_t TakeExtent(size_t len)
+    {
+        auto best = g_FreeBySize->lower_bound(len);
+        if (best == g_FreeBySize->end())
+        {
+            void* c = VirtualAlloc(nullptr, kChunkSize, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE);
+            if (!c) return 0;
+            const unsigned long long gen = static_cast<unsigned long long>(InterlockedIncrement64(&g_RegionGen));
+            g_Chunks->push_back(Chunk{ reinterpret_cast<uintptr_t>(c), gen });
+            AddFree(reinterpret_cast<uintptr_t>(c), kChunkSize);
+            best = g_FreeBySize->lower_bound(len);
+            if (best == g_FreeBySize->end()) return 0;
+        }
+        const uintptr_t at = best->second;
+        const size_t have = best->first;
+        RemoveFree(g_FreeByAddr->find(at));
+        if (have > len) AddFree(at + len, have - len);
+        return at;
+    }
+
+    /// Back into the free lists, merged with its neighbours inside the same chunk. g_FreeLock held.
+    void GiveExtent(uintptr_t at, size_t len)
+    {
+        const size_t chunk = ChunkOf(at);
+        auto next = g_FreeByAddr->lower_bound(at);
+        if (next != g_FreeByAddr->end() && next->first == at + len && ChunkOf(next->first) == chunk)
+        {
+            len += next->second;
+            RemoveFree(next);
+        }
+        auto prev = g_FreeByAddr->lower_bound(at);
+        if (prev != g_FreeByAddr->begin())
+        {
+            --prev;
+            if (prev->first + prev->second == at && ChunkOf(prev->first) == chunk)
+            {
+                at = prev->first;
+                len += prev->second;
+                RemoveFree(prev);
+            }
+        }
+        AddFree(at, len);
+    }
+
     void* LargeAlloc(uint64_t count)
     {
         const size_t size = RoundPage(count);
-        // MEM_WRITE_WATCH: see DGMalloc_WriteWatchRegions
-        void* p = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
-        if (!p) return nullptr;
-        const unsigned long long gen = static_cast<unsigned long long>(InterlockedIncrement64(&g_RegionGen));
+        void* p = nullptr;
+        size_t extent = 0;
+        if (size >= kOwnRegionMin)
+        {
+            p = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+            if (!p) return nullptr;
+        }
+        else
+        {
+            extent = (size + kUnit - 1) & ~(kUnit - 1);
+            AcquireSRWLockExclusive(&g_FreeLock);
+            const uintptr_t at = TakeExtent(extent);
+            ReleaseSRWLockExclusive(&g_FreeLock);
+            if (!at) return nullptr;
+            p = VirtualAlloc(reinterpret_cast<void*>(at), size, MEM_COMMIT, PAGE_READWRITE);
+            if (!p)
+            {
+                AcquireSRWLockExclusive(&g_FreeLock);
+                GiveExtent(at, extent);
+                ReleaseSRWLockExclusive(&g_FreeLock);
+                return nullptr;
+            }
+        }
+        // gen 0 = a chunk block (its chunk is the region); an own reservation is a region of its own
+        const unsigned long long gen = extent ? 0ull : static_cast<unsigned long long>(InterlockedIncrement64(&g_RegionGen));
         AcquireSRWLockExclusive(&g_LargeLock);
         (*g_Large)[p] = Region{ size, gen };
+        if (extent) (*g_Extent)[p] = extent;
         ReleaseSRWLockExclusive(&g_LargeLock);
         const LONG64 now = InterlockedAdd64(&g_LargeBytes, static_cast<LONG64>(size));
         LONG64 peak = g_LargePeakBytes;
@@ -111,14 +218,27 @@ namespace
     bool LargeFree(void* p)
     {
         if (!g_Large) return false;
-        size_t size = 0;
+        size_t size = 0, extent = 0;
         AcquireSRWLockExclusive(&g_LargeLock);
         auto it = g_Large->find(p);
         const bool found = it != g_Large->end();
-        if (found) { size = it->second.size; g_Large->erase(it); }
+        if (found)
+        {
+            size = it->second.size;
+            g_Large->erase(it);
+            auto e = g_Extent->find(p);
+            if (e != g_Extent->end()) { extent = e->second; g_Extent->erase(e); }
+        }
         ReleaseSRWLockExclusive(&g_LargeLock);
         if (!found) return false;
-        VirtualFree(p, 0, MEM_RELEASE);
+        if (!extent) VirtualFree(p, 0, MEM_RELEASE);
+        else
+        {
+            VirtualFree(p, size, MEM_DECOMMIT);
+            AcquireSRWLockExclusive(&g_FreeLock);
+            GiveExtent(reinterpret_cast<uintptr_t>(p), extent);
+            ReleaseSRWLockExclusive(&g_FreeLock);
+        }
         InterlockedAdd64(&g_LargeBytes, -static_cast<LONG64>(size));
         return true;
     }
@@ -293,6 +413,18 @@ namespace
 
     void SetStatus(const char* s) { strncpy_s(g_Status, s, _TRUNCATE); }
 
+#ifdef DGMALLOC_TEST
+    /// test/LargeBlocksTest.cpp: the large-block containers without the exe checks of Install.
+    void TestInitLarge()
+    {
+        g_Chunks = new std::vector<Chunk>();
+        g_FreeByAddr = new std::map<uintptr_t, size_t>();
+        g_FreeBySize = new std::multimap<size_t, uintptr_t>();
+        g_Extent = new std::unordered_map<void*, size_t>();
+        g_Large = new std::unordered_map<void*, Region>();
+    }
+#endif
+
     void Install()
     {
         if (!g_Regions)
@@ -343,6 +475,12 @@ namespace
         mi_option_set(mi_option_purge_delay, 0);
 
         mi_free(mi_malloc(16));
+        g_Chunks = new std::vector<Chunk>();
+        g_Chunks->reserve(64);
+        g_FreeByAddr = new std::map<uintptr_t, size_t>();
+        g_FreeBySize = new std::multimap<size_t, uintptr_t>();
+        g_Extent = new std::unordered_map<void*, size_t>();
+        g_Extent->reserve(1 << 17);
         auto* large = new std::unordered_map<void*, Region>();
         large->reserve(1 << 17);
         g_Large = large;
@@ -548,11 +686,23 @@ extern "C" size_t DGMalloc_WriteWatchRegions(DGMallocRegion* out, size_t max, un
         }
         ReleaseSRWLockShared(&g_RegionLock);
     }
+    if (g_Chunks)
+    {
+        AcquireSRWLockShared(&g_FreeLock);
+        for (const Chunk& c : *g_Chunks)
+        {
+            if (out && n < max) out[n] = DGMallocRegion{ reinterpret_cast<void*>(c.base), kChunkSize, c.gen };
+            ++n;
+        }
+        ReleaseSRWLockShared(&g_FreeLock);
+    }
     if (g_Large)
     {
+        // own reservations only (256 MB and more); chunk blocks (gen 0) are covered by their chunk
         AcquireSRWLockShared(&g_LargeLock);
         for (const auto& r : *g_Large)
         {
+            if (r.second.gen == 0) continue;
             if (out && n < max) out[n] = DGMallocRegion{ r.first, r.second.size, r.second.gen };
             ++n;
         }
