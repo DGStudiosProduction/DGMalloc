@@ -7,3 +7,4 @@ EXPORTS
     DGMalloc_Finding
     DGMalloc_Cut
     DGMalloc_ProcessInfo
+    DGMalloc_WriteWatchRegions

@@ -64,8 +64,18 @@ namespace
     constexpr uint64_t kLargeMin = 32768 + 1;
     constexpr uint32_t kLargeAlignMax = 64 * 1024;
 
+    /// One reservation the engine side may ask about: base, size and the order it was made in (a region reserved after
+    /// a consumer's last look is wholly new to it, even at an address reused since).
+    struct Region { size_t size; unsigned long long gen; };
+    volatile LONG64 g_RegionGen = 0;
+
     SRWLOCK g_LargeLock = SRWLOCK_INIT;
-    std::unordered_map<void*, size_t>* g_Large = nullptr;
+    std::unordered_map<void*, Region>* g_Large = nullptr;
+
+    // mimalloc's own reservations (prim.c reports them); created before mimalloc reserves anything, so none is missed
+    // after that - one made before it exists is simply unknown (callers treat unknown memory as written).
+    SRWLOCK g_RegionLock = SRWLOCK_INIT;
+    std::unordered_map<void*, Region>* g_Regions = nullptr;
     volatile LONG64 g_LargeBytes = 0;
     volatile LONG64 g_LargePeakBytes = 0;
 
@@ -77,7 +87,7 @@ namespace
         AcquireSRWLockShared(&g_LargeLock);
         auto it = g_Large->find(p);
         const bool found = it != g_Large->end();
-        if (found) size = it->second;
+        if (found) size = it->second.size;
         ReleaseSRWLockShared(&g_LargeLock);
         return found;
     }
@@ -85,10 +95,12 @@ namespace
     void* LargeAlloc(uint64_t count)
     {
         const size_t size = RoundPage(count);
-        void* p = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        // MEM_WRITE_WATCH: see DGMalloc_WriteWatchRegions
+        void* p = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
         if (!p) return nullptr;
+        const unsigned long long gen = static_cast<unsigned long long>(InterlockedIncrement64(&g_RegionGen));
         AcquireSRWLockExclusive(&g_LargeLock);
-        (*g_Large)[p] = size;
+        (*g_Large)[p] = Region{ size, gen };
         ReleaseSRWLockExclusive(&g_LargeLock);
         const LONG64 now = InterlockedAdd64(&g_LargeBytes, static_cast<LONG64>(size));
         LONG64 peak = g_LargePeakBytes;
@@ -103,7 +115,7 @@ namespace
         AcquireSRWLockExclusive(&g_LargeLock);
         auto it = g_Large->find(p);
         const bool found = it != g_Large->end();
-        if (found) { size = it->second; g_Large->erase(it); }
+        if (found) { size = it->second.size; g_Large->erase(it); }
         ReleaseSRWLockExclusive(&g_LargeLock);
         if (!found) return false;
         VirtualFree(p, 0, MEM_RELEASE);
@@ -283,6 +295,12 @@ namespace
 
     void Install()
     {
+        if (!g_Regions)
+        {
+            auto* regions = new std::unordered_map<void*, Region>();
+            regions->reserve(4096);
+            g_Regions = regions;
+        }
         const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
         const IMAGE_NT_HEADERS* nt = base ? NtHeaders(base) : nullptr;
         if (!nt) { SetStatus("off: no exe image"); return; }
@@ -325,7 +343,7 @@ namespace
         mi_option_set(mi_option_purge_delay, 0);
 
         mi_free(mi_malloc(16));
-        auto* large = new std::unordered_map<void*, size_t>();
+        auto* large = new std::unordered_map<void*, Region>();
         large->reserve(1 << 17);
         g_Large = large;
 
@@ -491,6 +509,57 @@ extern "C" HRESULT __cdecl CreateFX(const GUID* clsid, void** effect, const void
 }
 
 extern "C" const char* DGMalloc_Status() { return g_Status; }
+
+// ---- write watch ----------------------------------------------------------------------------------------------------
+// Every DGMalloc reservation (mimalloc's arenas / segments, our large blocks) is made with MEM_WRITE_WATCH. The engine side
+// (DGServerHealthMonitor DirtyPages.cpp) takes the regions here and asks GetWriteWatch itself, so it owns the reset policy.
+extern "C" void dgmalloc_region_reserved(void* base, size_t size)
+{
+    if (!base || !g_Regions) return;
+    const unsigned long long gen = static_cast<unsigned long long>(InterlockedIncrement64(&g_RegionGen));
+    AcquireSRWLockExclusive(&g_RegionLock);
+    (*g_Regions)[base] = Region{ size, gen };
+    ReleaseSRWLockExclusive(&g_RegionLock);
+}
+
+extern "C" void dgmalloc_region_released(void* base)
+{
+    if (!base || !g_Regions) return;
+    AcquireSRWLockExclusive(&g_RegionLock);
+    g_Regions->erase(base);
+    ReleaseSRWLockExclusive(&g_RegionLock);
+}
+
+struct DGMallocRegion { void* base; unsigned long long size; unsigned long long gen; };
+
+/// The write-watched regions now: up to `max` written to `out`; returns how many there are (call again with more room
+/// when it exceeds `max`). `*generation` = the newest generation handed out so far.
+extern "C" size_t DGMalloc_WriteWatchRegions(DGMallocRegion* out, size_t max, unsigned long long* generation)
+{
+    size_t n = 0;
+    if (generation) *generation = static_cast<unsigned long long>(g_RegionGen);
+    if (g_Regions)
+    {
+        AcquireSRWLockShared(&g_RegionLock);
+        for (const auto& r : *g_Regions)
+        {
+            if (out && n < max) out[n] = DGMallocRegion{ r.first, r.second.size, r.second.gen };
+            ++n;
+        }
+        ReleaseSRWLockShared(&g_RegionLock);
+    }
+    if (g_Large)
+    {
+        AcquireSRWLockShared(&g_LargeLock);
+        for (const auto& r : *g_Large)
+        {
+            if (out && n < max) out[n] = DGMallocRegion{ r.first, r.second.size, r.second.gen };
+            ++n;
+        }
+        ReleaseSRWLockShared(&g_LargeLock);
+    }
+    return n;
+}
 
 extern "C" long DGMalloc_ForeignFrees() { return g_ForeignFrees; }
 

@@ -13,6 +13,10 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/prim.h"
 #include <stdio.h>   // fputs, stderr
 
+// DGMalloc (DGMalloc.cpp): reservations made with MEM_WRITE_WATCH are reported here.
+extern void dgmalloc_region_reserved(void* base, size_t size);
+extern void dgmalloc_region_released(void* base);
+
 
 //---------------------------------------------
 // Dynamically bind Windows API points for portability
@@ -156,6 +160,7 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
 int _mi_prim_free(void* addr, size_t size ) {
   MI_UNUSED(size);
   DWORD errcode = 0;
+  dgmalloc_region_released(addr);
   bool err = (VirtualFree(addr, 0, MEM_RELEASE) == 0);
   if (err) { errcode = GetLastError(); }
   if (errcode == ERROR_INVALID_ADDRESS) {
@@ -166,6 +171,7 @@ int _mi_prim_free(void* addr, size_t size ) {
     VirtualQuery(addr, &info, sizeof(info));
     if (info.AllocationBase < addr && ((uint8_t*)addr - (uint8_t*)info.AllocationBase) < (ptrdiff_t)MI_SEGMENT_SIZE) {
       errcode = 0;
+      dgmalloc_region_released(info.AllocationBase);
       err = (VirtualFree(info.AllocationBase, 0, MEM_RELEASE) == 0);
       if (err) { errcode = GetLastError(); }
     }
@@ -178,7 +184,20 @@ int _mi_prim_free(void* addr, size_t size ) {
 // VirtualAlloc
 //---------------------------------------------
 
+// DGMalloc: every reservation carries MEM_WRITE_WATCH (not large pages: Windows refuses the combination) and is
+// registered, so the engine side can ask which pages were written (DGMalloc.cpp, DGMalloc_WriteWatchRegions).
+
+static void* win_virtual_alloc_prim_once_raw(void* addr, size_t size, size_t try_alignment, DWORD flags);
+
 static void* win_virtual_alloc_prim_once(void* addr, size_t size, size_t try_alignment, DWORD flags) {
+  const bool reserve = (flags & MEM_RESERVE) != 0 && (flags & MEM_LARGE_PAGES) == 0;
+  if (reserve) flags |= MEM_WRITE_WATCH;
+  void* p = win_virtual_alloc_prim_once_raw(addr, size, try_alignment, flags);
+  if (p != NULL && reserve) dgmalloc_region_reserved(p, size);
+  return p;
+}
+
+static void* win_virtual_alloc_prim_once_raw(void* addr, size_t size, size_t try_alignment, DWORD flags) {
   #if (MI_INTPTR_SIZE >= 8)
   // on 64-bit systems, try to use the virtual address area after 2TiB for 4MiB aligned allocations
   if (addr == NULL) {
