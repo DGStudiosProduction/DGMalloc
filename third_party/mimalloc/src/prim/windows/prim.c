@@ -190,12 +190,7 @@ int _mi_prim_free(void* addr, size_t size ) {
 static void* win_virtual_alloc_prim_once_raw(void* addr, size_t size, size_t try_alignment, DWORD flags);
 
 static void* win_virtual_alloc_prim_once(void* addr, size_t size, size_t try_alignment, DWORD flags) {
-#ifdef DGMALLOC_LARGE_PAGES
-  // the large-page build: no write watch at all (Windows refuses it with large pages, and nothing reads it)
-  const bool reserve = false;
-#else
   const bool reserve = (flags & MEM_RESERVE) != 0 && (flags & MEM_LARGE_PAGES) == 0;
-#endif
   if (reserve) flags |= MEM_WRITE_WATCH;
   void* p = win_virtual_alloc_prim_once_raw(addr, size, try_alignment, flags);
   if (p != NULL && reserve) dgmalloc_region_reserved(p, size);

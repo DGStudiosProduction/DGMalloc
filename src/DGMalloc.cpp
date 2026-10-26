@@ -9,9 +9,6 @@
 #include <cwchar>
 
 #include "mimalloc.h"
-#ifdef DGMALLOC_LARGE_PAGES
-extern "C" size_t dgmalloc_os_enable_large_pages(void);
-#endif
 
 #include <unordered_map>
 #include <map>
@@ -67,9 +64,6 @@ namespace
     }
 
     constexpr uint64_t kLargeMin = 32768 + 1;
-#ifdef DGMALLOC_LARGE_PAGES
-    constexpr size_t kLargePageArena = size_t(8) << 30;   ///< committed + locked at start
-#endif
     constexpr uint32_t kLargeAlignMax = 64 * 1024;
 
     /// One reservation the engine side may ask about: base, size and the order it was made in (a region reserved after
@@ -375,7 +369,7 @@ namespace
         virtual bool Exec(UWorld*, const wchar_t*, FOutputDevice*) { return false; }
         virtual uint64_t QuantizeSize(uint64_t count, uint32_t align)
         {
-            if (count >= kLargeMin && align <= kLargeAlignMax && g_Large) return RoundPage(count);
+            if (count >= kLargeMin && align <= kLargeAlignMax) return RoundPage(count);
             return align <= kMinAlign ? mi_good_size(Round16(count)) : count;
         }
         virtual void* Malloc(uint64_t count, uint32_t align) { return DoMalloc(count, align); }
@@ -475,32 +469,6 @@ namespace
 #ifdef DGMALLOC_DIAGNOSTIC
         mi_option_enable(mi_option_show_errors);
         mi_register_error(&HeapErrorHandler, nullptr);
-#endif
-#ifdef DGMALLOC_LARGE_PAGES
-        // Large-page build: every allocation from mimalloc (no own large blocks, no write watch); one arena of 2 MB pages,
-        // committed and locked up front, then further arenas eagerly committed (mimalloc uses large pages for them too
-        // while Windows can still find contiguous 2 MB frames). Large pages cannot be decommitted: purging stays off.
-        const size_t largePage = dgmalloc_os_enable_large_pages();
-        mi_option_set(mi_option_eager_commit, 1);
-        mi_option_set(mi_option_arena_eager_commit, 1);
-        mi_option_set(mi_option_purge_delay, -1);
-        int arenaRc = -1;
-        if (largePage) arenaRc = mi_reserve_os_memory(kLargePageArena, true, true);
-        mi_free(mi_malloc(16));
-        void* probe = mi_malloc(64);
-        PSAPI_WORKING_SET_EX_INFORMATION wsi{};
-        wsi.VirtualAddress = probe;
-        const bool probeLarge = QueryWorkingSetEx(GetCurrentProcess(), &wsi, sizeof(wsi)) && wsi.VirtualAttributes.Valid && wsi.VirtualAttributes.LargePage;
-        mi_free(probe);
-        char st[96];
-        sprintf_s(st, "%s, large pages %s (page %zu KB, arena %zu GB %s)", kOnStatus, probeLarge ? "ON" : "OFF", largePage >> 10,
-                  kLargePageArena >> 30, arenaRc == 0 ? "reserved" : (largePage ? "refused" : "no privilege"));
-        g_Large = nullptr;
-        DGMallocImpl* lpAlloc = new (g_Storage) DGMallocImpl();
-        InterlockedExchangePointer(gmalloc, lpAlloc);
-        InterlockedExchange(&g_Installed, 1);
-        SetStatus(st);
-        return;
 #endif
         mi_option_set(mi_option_eager_commit, 0);
         mi_option_set(mi_option_arena_eager_commit, 0);
